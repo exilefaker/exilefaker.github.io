@@ -1,9 +1,1108 @@
 <html>
 <head>
+<script src="images_50000.js" language="Javascript"></script>
+<script src="labels_50000.js" language="Javascript"></script>
+<script language="JavaScript" type="text/JavaScript">
+////////NOTES:  
+//
+// BMODE (1 = use biases to initialize generative sweep; 0 = use H3 state from previous forward pass) set to 0.
+// Got the weights for generating and recognizing labels sorted out. Going to try a joint model now.
+//
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//////UPDATES:
+//
+//  - Weight cap disabled (5.19.15)
+//  - Added receptive field regularization for L1 of generative model (5.18.15)
+//  - Receptive field foci change adaptively (also 5.18.15) 
+//
+//	- Regularization added [controlled by var 'lambda'] (5.9.15)
+//  - Weight updates made in parallel (5.9.15)
+//  - Weight report added (5.9.15)
+//  - Pause button added (5.8.15)
+//  - "Random Image" button generates translated/wrapped versions of the original 4 images (10.26.14)
+//  
+//CSS NEURAL NETWORK implementing Hinton's wake-sleep algorithm:
+//http://www.gatsby.ucl.ac.uk/~dayan/papers/hdfn95.pdf
+//code by Alex Kiefer (akiefer@gmail.com)
+//
+//LEGEND:
+//
+//	LEFT PANEL (network display):
+//
+//		o o o o o o o o o o  Recognition Input Layer / Generative Output Layer
+//		| | | | | | | | | |
+//		o o o o o o o o o o
+//		o o o o o o o o o o  Hidden layer 1
+//		| | | | | | | | | |
+//		o o o o o o o o o o
+//		o o o o o o o o o o  Hidden layer 2
+//		| | | | | | | | | |
+//		o o o o o o o o o o
+//		o o o o o o o o o o  Hidden layer 3 / Last Recognition Layer / First Generative Layer
+//
+//		Red square = Active neuron
+//		Blue outline = Expected activation
+//
+//	MIDDLE PANEL (probabilities):
+//
+//		Top line in each square:  Probability that corresponding unit is on during "wake" phase
+//		Bottom line:  Probability that unit is on during "sleep" phase
+//
+//	RIGHT PANEL (controls / info):
+//
+//		By default, one of 10 fixed patterns are chosen for the input layer at each cycle	
+//		Click a block on the rightmost panel to switch to fixed structured input (or 0 to switch back to random).
+//		
+//		Learning rate and number of cycles completed are displayed below the buttons
+//
+//INDEXES (example):
+//
+//	Units for (10 x 20 x 20 x 20) network:
+//		0 - 9:  Input Layer
+//		10 - 29:  Hidden layer 1
+//		30 - 49:  Hidden layer 2
+//		50 - 69:  Hidden layer 3
+//
+//	Weights:
+//		0 - 999: Recognition 
+//			0-199:  From input to H1
+//				0-9: from (i1-i10) > h1
+//				10-19: from (i1-i10) > h2 
+//				...
+//  		200-599:  From H1 to H2
+//  		600-999:  From H2 to H3
+//		1000 - 1999:  Generative
+//			1000-1399:  From H3 to H2
+//			1400-1799:  From H2 to H1
+//  		1800-1999:	From H1 to input 
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Initialize variables
+
+const sample = (x) => (Math.random() < x)/1.; //sample a binary value with probability x of 1
+const negLogProb = (state,prob) => state.map(function(x,i){return -Math.log(prob[i]+1e-12)*x - Math.log(1-prob[i]+1e-12)*(1-x)}); //-log(p) of binary variable
+
+//function to sum arrays (from https://codeburst.io/javascript-arrays-finding-the-minimum-maximum-sum-average-values-f02f1b0ce332)
+const arrSum = arr => arr.reduce((a,b) => a + b, 0)
+
+const arrAdd = (arr1, arr2) => arr1.map(function(x,i){return x + arr2[i]}); //add arrays
+const matAdd = (mat1, mat2) => mat1.map(function(x,i) {return arrAdd(x,mat2[i])}); //add matrices
+const dot = (arr1, arr2) => arr1.reduce(function(r,a,i){return r + a*arr2[i]},0); //vector dot product
+const matrix_multiply = (mat, arr) => mat.map(function(x) {return dot(x,arr)}); //matrix multiply
+const outer = (arr1,arr2) => arr1.map(function(x,i){return scale(arr2,x)}); //vector outer product
+const scale = (arr,scalar) => arr.map(function(x) {return x*scalar}); //multiply array by scalar
+const matrix_scale = (mat,scalar) => mat.map(function(x,i) {return scale(mat[i],scalar)}); //multiply matrix by scalar
+
+
+//Dictionaries to choose hex values for display colors
+let hexes = {0: "00", 1: "AA"};
+let hexes2 = {0: "00", 1: "FF"};
+let wsmode = {0: "contrastive", 1: "standard"};
+
+//Layer dimensions: [Input, H1, H2, H3]. Labels are handled separately for now
+let dims = [784, 256, 32, 10];
+
+//activities / layer outputs
+let a = [];
+//generative and recognition probabilities
+let p = [];
+let q = [];
+//biases
+let d = [];
+let b = [];
+//bias gradients
+let d_d = [];
+let d_b = [];
+//generative and recognition weights
+let g = [];
+let r = [];
+//and their gradients
+let d_g = [];
+let d_r = [];
+
+//label variables
+var numLabe = 0; //number of distinct labels N
+var numLabels = 0; //units in label layer (usually same as N)
+var labels = []; //label states/label unit activities
+var label_p = []; //p(label)
+var label_q = []; //q(label)
+var label_b = []; //label recognition bias (used to fix labels for each input)
+var label_d = []; //label generative bias
+var label_d_b = []; //gradients
+var label_d_d = []; //gradients
+//weights + gradients
+var labelRec = [];
+var d_lr = [];
+var labelGen = [];
+var d_lg = [];
+
+//total number of units (initialized later along with other parameters)
+var numUnits = 0;
+
+//other system variables and hyperparameters
+var bmode = 1; //bmode = 0 --> each generative pass begins with results of previous forward pass / bmode = 1 --> use generative biases to initiate top-down pass
+var clockStart; //for use with setInterval to run animation
+var allData = ""; //for use in reporting weights (currently turned off)
+var Report = 0; //""
+var textNums = []; //variable to set biases for input layer given an image -- will be deprecated
+var alpha = 0.006; // Learning rate; canonical setting: 0.002
+var lambda = []; // per-weight regularization parameter - not currently used
+var lambdaBase = 0.0006; //regularization parameter (weights are scaled by 1 - lambdaBase on each update); canonical setting: 0.0004
+var chosenInput = 0; //Stores most recently selected input
+var interSpeed = 1; //Speed parameter (not used currently)
+var cycles = 0; //counter for how many wake-sleep cycles have occurred
+var feedback = 0; //Toggles feedback mode (results of fantasy used for forward prop)
+var genmode = 0; ///Toggles generative mode (just runs the gen. model--not used currently)
+var updatemode = 1; //Toggles learning
+var paused = 0; //Paused state
+
+let estimateMode = 0; //Toggles estimate mode (1000 recognition sweeps to estimate free energy)
+let energy = []; //array of per-sample energies
+let entropy = []; //array of per-sample entropies
+let energyCounter = 0; //Counter up to N = 1000 estimates
+let freeEnergy = []; //array of per-sample free energies
+let hidden_energy = [];
+let estNum = 0;
+let oldmean = 0;
+let scalingFactor = 1;
+let oldFactor = 0;
+
+var ims = [];
+ims.push(0);
+ims.push([7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, -6, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, -6, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, -6, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, -6, -6, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, -6, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, -6, 7, 7, 7, 7, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, -6, 7, -6, -6, -6, -6, -6, -6, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, -6, -6, -6, -6, -6, -6, -6, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, -6, -3, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, -3, -6, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, -3, -3, 7, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, -6, 7, -3, 7, -3, -6, 7, 7, -3, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]);
+
+ims.push([-6, -6, -6, -6, -6, -2, 7, -6, -6, -6, 7, 7, -5, -6, 7, 7, 7, 1, -6, -6, -6, -6, -6, -4, 7, 7, 1, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, -6, -6, -6, 7, 7, 7, -6, -1, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, -5, -6, -6, 7, 7, 7, -6, -6, 7, 7, 7, -4, -6, -6, -6, -6, -6, 7, 7, 7, 0, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -2, 7, 7, -3, -6, -6, 7, 7, 7, -4, -6, 7, 7, 7, 7, -6, -6, -6, -6, -6, 3, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 4, 7, 7, -1, -6, -6, 7, 7, 7, 3, -6, 7, 7, 7, 7, 0, -6, -6, -6, -6, 1, 7, 7, 7, 1, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 2, -6, -4, 7, 7, 7, 7, -6, 0, 7, 7, 7, 7, -6, -6, -6, -6, -4, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -2, 7, 7, 7, 2, -6, -3, 7, 7, 7, 7, -1, -6, 7, 7, 7, 7, 4, -6, -6, -6, -6, 7, 7, 7, 7, 2, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 4, 7, 7, 7, 2, -6, 0, 7, 7, 7, 7, 7, -6, 7, 7, 7, 7, 7, -3, -6, -6, -6, 4, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 4, -6, 0, 7, 7, 7, 7, 7, -2, 3, 7, 7, 7, 7, 7, -6, -6, -6, 1, 7, 7, 7, 7, 3, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 1, 7, 7, 7, 7, 7, -6, 1, 7, 4, 1, -4, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 0, 2, 3, 4, 7, -3, -6, -6, -6, 2, -6, -6, -4, -6, -6, -6, 7, 7, 7, 7, 2, -4, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -5, -6, -6, -6, 3, -6, -6, 3, -1, -5, -6, -5, -4, -6, 1, 7, 7, 7, 7, 7, 7, 0, 4, 7, 7, 7, 4, 3, 3, -3, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 3, -6, -6, -4, -2, 4, 7, 7, 7, -3, 7, 1, -3, 7, 7, 7, 7, 7, 7, 7, -1, -5, -4, -4, -6, -3, -6, -6, -2, -2, -4, -6, -6, -5, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 2, 3, 7, 3, -6, -6, -4, 4, 7, 4, -2, -6, -6, -6, -6, -6, -6, -6, -6, -6, 1, 7, 4, -2, -6, -6, 1, -6, -6, 7, -1, -6, -6, -6, -6, 7, 7, 7, 7, 7, -4, -6, 4, 7, 7, 1, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -5, 2, 0, -6, -4, -6, 0, 7, -6, -6, -6, -6, 4, 7, 7, 7, 7, 7, -6, -6, -6, 1, 4, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 0, 0, -6, -6, 7, -5, -6, -6, -6, -3, 7, 7, 7, 7, 7, 3, -3, -6, -6, -6, -6, -6, -6, -6, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 2, -6, -6, -6, -6, 7, 7, 3, -6, 3, 2, -6, -6, -6, -6, 7, 7, 7, 7, 7, 0, -6, -6, -6, -6, -6, -6, 1, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, -3, -6, -6, 7, 7, -1, -3, 7, -6, -6, -6, -6, 4, 7, 7, 7, 7, 7, 4, -6, -6, -6, -6, 7, 7, 7, 7, -5, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 1, -6, 1, 7, 7, -1, 7, -4, -6, -6, -6, -3, 7, 7, 7, 7, 7, 7, -3, -6, -6, 1, 7, 7, 7, 7, 3, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 4, 7, 7, 7, 3, -2, 7, 7, 7, 7, 7, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 2, -6, -6, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -3, -1, -6, 7, 7, 7, 7, 4, 7, 7, 7, 7, 7, -6, -6, -6, -6, 0, 7, 7, 7, 7, 7, 7, 7, 4, -6, -5, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 7, 7, 7, 7, 7, -6, -6, 7, 4, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, 1, 7, -5, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -1, 7, -6, -5, -5, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 2, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -1, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 3, -6, -6, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, -6, -6, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, 7, -3, -6, -4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -6, -5, 7, 1, -6, -2, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]);
+
+ims.push([7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -2, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 4, -5, -1, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -5, -5, -2, 0, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 4, -5, -5, -5, -5, -5, -5, -3, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, -5, -5, -5, -5, -5, -5, -5, -5, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 3, -5, -5, -5, -5, -5, -5, -5, -5, -5, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -2, -5, -5, -5, -5, -5, -5, -5, -5, -5, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, -5, -5, -5, -5, -5, -5, -2, -1, 2, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 4, -5, -5, -5, -5, -5, -2, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -1, -5, -5, -5, -5, -5, 5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, -5, -5, -5, -5, -5, -4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 4, -5, -5, -5, -5, -5, -5, -5, -4, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, -5, -5, -5, -5, -5, -5, -5, -5, -5, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -1, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -6, 3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -1, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -4, 5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 4, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -1, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -4, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -5, -5, -4, -3, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -5, -5, 4, 5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 1, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -5, -5, 7, 3, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, -5, -5, -1, 7, -2, -5, -5, -1, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, -5, -5, 6, 7, -5, -5, -5, 7, 7, -4, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 4, -5, -3, 7, 5, -5, -5, 0, 7, 6, 7, -1, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, -5, 3, 7, 1, -5, -5, 4, 7, 7, 7, 1, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -2, 2, 5, 5, 5, 5, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, -5, -5, 6, 7, -1, -5, -5, 7, 7, 7, 0, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, 7, 7, 7, 7, 7, 1, -3, -5, -5, 7, 7, -5, -5, 0, 7, 7, 7, 4, -5, -5, -5, -5, -5, -5, -5, -5, -5, -1, 5, 2, 1, -2, -2, -1, 0, 0, 1, 1, 1, 2, 7, 7, 7, 7, 5, -5, -5, -5, 1, 7, 0, -5, -5, 2, 7, 7, 7, 4, -5, -5, -5, -4, -3, -3, 0, 1, 5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 5, 6, 7, 7, -5, -5, -5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 4, 2, 5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]);
+
+ims.push([-3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -4, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, 7, 7, -6, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -8, -3, -6, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -5, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, -5, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -7, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -7, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -6, -3, -3, -3, -3, -3, -3, -3, -3, -5, -5, -7, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -5, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -6, 7, 7, 7, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, 7, -5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -3, -3, -3, -3, -3, -3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -4, -3, -3]);
+
+//Populate divs
+window.onload = function () {
+
+    init(dims);
+
+	for (var i = 0; i < dims[0]; i++) {
+		document.getElementById("input").innerHTML = document.getElementById("input").innerHTML + "<div class='sunit' id='x_rec" + i + "' onclick='javascript:holds(0,"+i+")'></div>";
+		document.getElementById("L1").innerHTML = document.getElementById("L1").innerHTML + "<div class='sunit' id='h0_gen" + i + "' onclick='javascript:holds(0,"+i+")'></div>";
+	}
+    
+	for (var i = 0; i < dims[1]; i++) {
+		document.getElementById("H1").innerHTML = document.getElementById("H1").innerHTML + "<div class='unit' id='h1_rec" + i + "' onclick='javascript:holds(1,"+i+")'></div>";
+		document.getElementById("L2").innerHTML = document.getElementById("L2").innerHTML + "<div class='unit' id='h1_gen" + i + "'></div>";
+	}
+	for (var i = 0; i < dims[2]; i++) {
+		document.getElementById("H2").innerHTML = document.getElementById("H2").innerHTML + "<div class='unit' id='h2_rec"+ i + "' onclick='javascript:holds(2,"+i+")'></div>";
+		document.getElementById("L3").innerHTML = document.getElementById("L3").innerHTML + "<div class='unit' id='h2_gen"+ i + "'></div>";
+	}
+	for (var i = 0; i < dims[3]; i++) {
+		document.getElementById("H3").innerHTML += "<div class='unit' id='h3_rec"+ i + "' onclick='javascript:holds(3,"+i+")'></div>";
+		document.getElementById("L4").innerHTML += "<div class='unit' id='h3_gen"+ i + "'></div>";
+	}
+	for (var i = 0; i < numLabels; i++) {
+		document.getElementById("label").innerHTML += "<div class='sunit' id='rec_label"+ i + "' onclick='javascript:holds(4,"+i+")'></div>";
+		document.getElementById("genLabel").innerHTML += "<div class='sunit' id='gen_label"+ i + "'></div>";
+	}
+
+
+	document.getElementById("speed").innerHTML = "Learning rate: " + alpha;
+	document.getElementById("lambda").innerHTML = "Regularization: " + lambdaBase;
+	changeInput(8);
+	document.getElementById("info").innerHTML = "W-S mode: " + wsmode[bmode];
+}
+
+//FUNCTIONS:
+
+function init(dims) {
+
+    for (var l = 0; l < dims.length; l++) {
+
+    //fill out initial values (small random number close to 0 for weights; 0.5 for probabilities; 0 for biases)
+        a.push(Array.from(Array(dims[l])).map(x=>Math.floor(Math.random()*2)));
+        p.push(Array(dims[l]).fill(0.5));
+        q.push(Array(dims[l]).fill(0.5));
+
+        b.push(Array(dims[l]).fill(0));
+        d.push(Array(dims[l]).fill(0));
+        d_b.push(Array(dims[l]).fill(0));
+        d_d.push(Array(dims[l]).fill(0));
+
+        if (l > 0) {
+        	r.push(Array.from(Array(dims[l])).map(x=>Array.from(Array(dims[l-1])).map(x=>-0.01 + Math.random()*0.02)));
+            d_r.push(Array(dims[l]).fill(Array(dims[l-1]).fill(0)));
+            g.push(Array.from(Array(dims[l-1])).map(x=>Array.from(Array(dims[l])).map(x=>-0.01 + Math.random()*0.02)));
+            d_g.push(Array(dims[l-1]).fill(Array(dims[l]).fill(0)));
+        }
+    }
+ 
+    //deal with label units and weights separately for now (ideally, come up with a syntax for specifying these in the "dims" argument)
+    numLabe = 10;
+    numLabels = 10;
+    labels = new Array(numLabels).fill(0);
+    label_p = new Array(numLabels).fill(0.5);
+    label_q = new Array(numLabels).fill(0.5);
+    label_b = new Array(numLabels).fill(0);
+    label_d = new Array(numLabels).fill(0);
+    label_d_b = new Array(numLabels).fill(0);
+    label_d_d = new Array(numLabels).fill(0);
+
+    labelRec = Array.from(Array(dims[dims.length-1])).map(x=>Array.from(Array(numLabels)).map(x=>-0.01 + Math.random()*0.02));
+    d_lr.push(Array(dims[dims.length-1]).fill(Array(numLabels).fill(0)));
+    labelGen = Array.from(Array(numLabels)).map(x=>Array.from(Array(dims[dims.length-1])).map(x=>-0.01 + Math.random()*0.02));
+    d_lg.push(Array(numLabels).fill(Array(dims[dims.length-1]).fill(0)));
+
+    numUnits = arrSum(dims) + numLabels.length;
+
+    textNums = Array(dims[0]).fill(4.5);
+}
+
+//Generate weight report
+function tellMe() {
+	Report = 1;
+}
+
+//Calculate sigmoid of summed input
+function sigmoid(num) {
+	return (1 / (1 + Math.exp(-num)));
+}
+
+//Change input via buttons
+function changeInput(whichInput) {
+	for (i=0;i<9;i++) {
+	document.getElementById("n" + i).style.background = "#3CAA48";
+	}
+	document.getElementById("n" + whichInput).style.background = "#FF0000";
+	chosenInput = whichInput;
+
+	if (whichInput == 5) {
+		if (feedback == 0) {
+			feedback = 1;
+			for (i = 0; i < dims[0]; i++) {
+				b[0][i] = 0;
+			}
+		}
+		else {
+			feedback= 0;
+			chosenInput = 0;
+		}
+	}
+
+	else {
+		feedback = 0;
+	}
+	if (whichInput != 7 && whichInput != 8) {
+	    for (i = 0; i < numLabe; i++){
+		    if (i == (whichInput-1)) {
+			    for (j = 0; j < 10; j++) {
+			    label_b[(i*10) + j] = 14;	
+			    }
+		    }
+		    else {
+			    for (j = 0; j < 10; j++) {
+			    label_b[(i*10) +j] = -14;
+			    }
+		    }
+	    }
+	}
+}
+
+//Toggle learning
+function toggleLearning() {
+
+	if (updatemode == 0) {
+		updatemode = 1;
+		document.getElementById("tb0").style.background = "#FF0000";
+	}
+	else {
+		updatemode = 0;
+		document.getElementById("tb0").style.background = "#3CAA48";
+	}
+}
+
+//Pause/unpause
+function togglePause() {
+
+	if (paused == 0) {
+		paused = 1;
+		document.getElementById("p").style.background = "#FF0000";
+	}
+	else {
+		paused = 0;
+		document.getElementById("p").style.background = "#3CAA48";
+	}
+}
+
+//Change input via buttons
+function changeSpeed(speed) {
+	interSpeed = speed;
+}
+
+//Generate noise
+function generateNoise() {
+	b[0] = Array(dims[0]).fill(0);
+	a[0] = Array.from(Array(dims[0])).map(x=>Math.floor(Math.random()*2));
+	p[0] = a[0];
+    for (var i = 0; i < dims[0]; i++) {
+		if (a[0][i] == 0) { document.getElementById("x_rec" + i).style.background = "#000000"; }
+		if (a[0][i] == 1) { document.getElementById("x_rec" + i).style.background = "#FF0000"; }
+		}
+	}
+
+function baseConverter(numb,ob,nb) {
+
+	// Created 1997 by Brian Risk.  http://brianrisk.com
+
+	var list = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	var dec = 0;
+
+	for (var i = 0; i <=  numb.length; i++) {
+		dec += (list.indexOf(numb.charAt(i))) * (Math.pow(ob, (numb.length - i - 1)));
+	}
+	numb = "";
+
+	var magnitude = Math.floor((Math.log(dec))/(Math.log(nb)));
+	for (var i = magnitude; i >= 0; i--) {
+		var amount = Math.floor(dec/Math.pow(nb,i));
+		numb = numb + list.charAt(amount); 
+		dec -= amount*(Math.pow(nb,i));
+	}
+
+    //For this application, always return 2 digits (in hex)
+	if (numb.length < 2) {
+		numb = numb.padStart(2, '0');
+	}
+
+	return numb;
+}
+
+//Toggle holds
+function holds(layer,unit) {
+	document.getElementById("message").innerHTML = p[layer][unit]
+	//if (b[layer][unit] == 0) {
+	//	b[layer][unit] = N;
+	//	document.getElementById("h" + layer + "_gen" + unit).style.background = "#FF0000";
+	//}
+	//else {
+	//	if (b[layer][unit] == -N) {
+	//		b[layer][unit] = 0;
+	//	}
+	//	else { 
+	//		b[layer][unit] = -N;
+	//		document.getElementById("h" + layer + "_gen" + unit).style.background = "#3CAA48";
+	//	}
+	//} 
+
+	}
+
+//Read data from file
+function readFile(file, num) {
+
+    textNums = ims[num];
+    changeInput(num);
+
+}
+
+function colorUnit(probs, states, layer, redorblue) {
+	//probs: probability distribution (array of p-values)
+	//states: relevant states to color (array of activities)
+	//layer: which div to affect (string)
+	//redorblue: which color? ("red" otherwise defaults to blue)
+    let colorMe = probs.map(function(x,i) {return Math.floor(x * states[i] *255).toString();});
+    let colHex = colorMe.map(function(x) {return baseConverter(x,10,16)});
+    if (redorblue == "red") {
+        colHex.map(function(x,i){document.getElementById(layer + i).style.background = "#" + x + "0000";});
+    }
+    else {
+    	colHex.map(function(x,i){document.getElementById(layer + i).style.background = "#00" + x + "" + x;});
+    }
+}
+
+//Reset weights
+function resetWeights() {
+    init(dims);
+}
+
+//Toggle estimate mode
+function toggleEstMode() {
+	estimateMode = 1;
+	entropy = [];
+	energy = [];
+	freeEnergy = [];
+	hidden_energy = [];
+	energyCounter = 0;
+	let L = dims.length-1;
+	p[L] = d[L].map(sigmoid);
+}
+
+//Estimate free energy
+function energyEstimate() {
+	if (energyCounter < 1000) {
+		entropy.push(0);
+		energy.push(0);
+		freeEnergy.push(0);
+		hidden_energy.push(0);
+
+        //Energy and entropy due to top layer (incl. labels)
+	    let L = dims.length-1
+		
+		energy[energyCounter] += arrSum(negLogProb(a[L],p[L]));	
+	    let z = matrix_multiply(labelGen,a[L]);
+	    z = arrAdd(z, label_d);
+	    label_p = z.map(sigmoid);
+	    energy[energyCounter] += arrSum(negLogProb(labels,label_p));
+
+	    entropy[energyCounter] += arrSum(negLogProb(a[L],q[L]));
+
+        //Energy/entropy for other hidden layers
+	    for (var l = dims.length-2; l>0; l--) {
+	    	entropy[energyCounter] += arrSum(negLogProb(a[l],q[l]));
+
+            z = matrix_multiply(g[l],a[l+1]);
+            z = arrAdd(z, d[l]);
+            p[l] = z.map(sigmoid);
+            energy[energyCounter] += arrSum(negLogProb(a[l],p[l]));
+	    }
+        //Energy due to input layer
+        z = matrix_multiply(g[0],a[1]);
+        z = arrAdd(z, d[0]);
+        p[0] = z.map(sigmoid);
+        hidden_energy[energyCounter] += energy[energyCounter];
+        energy[energyCounter] += arrSum(negLogProb(a[0],p[0]));
+
+        freeEnergy[energyCounter] = energy[energyCounter] - entropy[energyCounter];
+        if (isNaN(freeEnergy[energyCounter]) == true) {
+			alert("counter: " + energyCounter 
+				+ ", energy: " + energy[energyCounter] 
+				+ ", entropy: " + entropy[energyCounter] 
+				+ ", FE: " + freeEnergy[energyCounter]
+				);
+		}
+		energyCounter += 1;
+	}
+	else {
+		let mean = arrSum(freeEnergy)/1000;
+		if (mean > oldmean) {
+			oldmean = mean;
+			oldFactor = scalingFactor;
+			scalingFactor = 300/mean;
+		    for (var iter = 0; iter < estNum; iter++) {
+		    	let curHeight = parseInt(document.getElementById("fe_est" + iter).style.height);
+		    	document.getElementById("fe_est" + iter).style.height = (curHeight*(1/oldFactor))*scalingFactor + "px"; 
+		    }
+		}
+
+		let squaredDeviations = freeEnergy.map(function(x){return Math.pow(x-mean,2)});
+		let variance = arrSum(squaredDeviations)/999;
+		let avgEnergy = arrSum(energy)/1000;
+		let avgEntropy = arrSum(entropy)/1000;
+		let avgHiddenEnergy = arrSum(hidden_energy)/1000;
+		
+		document.getElementById("energy").innerHTML += "<br>---------------<br>FE estimate at " + cycles + " cycles: " + mean + "<br>variance: " + variance + "<br>avg.energy: " + avgEnergy + "<br>avg.entropy: " + avgEntropy + "<br>avg.hidden state energy: " + avgHiddenEnergy + "<br>";
+		document.getElementById("FE_graph").innerHTML += "<div class='bar' style='height: " + mean*scalingFactor + "px;' id='fe_est" + estNum + "'></div>";
+		
+		estimateMode = 0;
+		estNum += 1;
+	}
+
+}
+
+//MAIN LOOP
+function main() {
+
+    if (paused == 0) {
+	
+	    //Wake-sleep cycle
+	    chooseInput(chosenInput);
+	    forwardprop();
+        //Just do forward prop if estimating FE
+	    if (estimateMode == 0) {
+	        if (updatemode == 1) {
+		        updategen();
+	        }
+		    fantasy();
+	        if (updatemode == 1) {
+		        updaterec();
+		        updateC();
+	        }
+        }
+        else {
+        	energyEstimate();
+        }
+    }
+}
+
+//Select input
+function chooseInput(cyc) {
+
+	//Choose a pattern randomly
+	if (cyc == 7) {
+
+		var which = Math.floor((Math.random()*5)+0);
+		if (which > 0) {
+
+		readFile("input" + which + ".html", which);		
+
+		for (i = 0; i < numLabe; i++){
+			if (i == (which-1)) {
+				for (j = 0; j < 10; j++) {
+				label_b[(i*10) + j] = 14;	
+			}
+		}
+		else {
+			for (j = 0; j < 10; j++) {
+			label_b[(i*10) +j] = -14;
+			}
+		}
+	}
+		//randomly shift
+		//var offset = Math.floor((Math.random()*curText.length) +0);
+		 //	var part1 = curText.slice(0, offset);
+		 	//var part2 = curText.slice(offset);
+		 	//part2.push(part1);
+		 //	curText = part2;
+		 		//alert(curText);
+			//for (i=0; i < curText.length -1; i ++) {
+            //    textNums[i] = curText[i].charCodeAt(0);
+            //    	if (textNums[i] == 65533) {
+                		//textNums[i] = 0;
+            //    	}
+            //    }
+
+		for (i=0;i<dims[0];i++) {
+		
+			b[0][i] = ((textNums[i]*-1) + 4.5);
+			//b[numUnits + i] = ((textNums[i]*-1) + 4.5);
+			//b[i] = (logit((textNums[i]/128) + .0))*1;
+			//alert(b[i]);
+		}
+
+		}
+		else {
+			generateNoise();
+			}
+
+		changeInput(7);
+	
+	}
+
+    //Draw from MNIST
+	if (cyc == 8) {
+        var which = Math.floor((Math.random()*60000));
+
+        textNums = mnist_images[which];
+
+        //textNums = atob(mnist_images_raw[which]).split("")
+        //textNums = mnist_images_raw[which].split("")
+
+        let curLabe = mnist_labels[which];
+
+		for (i = 0; i < numLabe; i++){
+			if (i == curLabe) {
+				label_b[i] = 14;	
+			}
+		    else {
+			    label_b[i] = -14;
+		    }
+	    }
+
+		for (i=0;i<dims[0];i++) {
+			b[0][i] = ((textNums[i]*-1) + 4.5);
+		}
+		document.getElementById("C0").innerHTML = 'Digit #' + which + ", label: " + curLabe;
+		changeInput(8);
+	}
+
+	//Choose a state randomly
+	if (cyc == 0) {		
+		generateNoise();
+	}
+
+   	if (cyc == 5) {
+   	}
+
+   	else {
+
+   		if (cyc != 0) {
+
+		for (i=0; i < dims[0]; i++) {
+		
+			b[0][i] = ((textNums[i]*-1) + 4.5);
+			//b[i] = (logit((textNums[i]/128) + .0))*1;
+			//alert(b[i]);
+		}
+
+	}
+
+   	}
+
+}
+
+//Driving using rec weights
+function forwardprop() {
+
+	//Input layer
+	if (feedback == 0) {
+		q[0] = b[0].map(sigmoid);
+        a[0] = q[0].map(function(x) { return (Math.random() < x)/1.});
+    }
+    	//Display
+    colorUnit(q[0],a[0],"x_rec", "red");
+
+    //let colorMe = q[0].map(function(x,i) {return Math.floor(x * a[0][i] *255).toString();});
+    //let colHex = colorMe.map(function(x) {return baseConverter(x,10,16)});
+    //colHex.map(function(x,i){document.getElementById("x_rec" + i).style.background = "#" + x + "0000";});
+
+    //a[0].map(function(x,i){document.getElementById("x_rec" + i).style.background = "#" + hexes2[x] + "0000";});
+
+	//Labels
+	if (feedback == 0) {
+		label_q = label_b.map(sigmoid);
+		labels = label_q.map(sample);
+	}
+	labels.map(function(x,i){document.getElementById("rec_label" + i).style.background = "#" + hexes2[x] + "0000";});
+
+    //Hidden layers 1 through L-1
+    for (l = 1; l < dims.length-1; l++) {
+	    let z = matrix_multiply(r[l-1],a[l-1]);
+	    z = arrAdd(z, b[l]);
+	    q[l] = z.map(sigmoid);
+	    a[l] = q[l].map(sample);
+
+	    colorUnit(q[l],a[l],"h" + l + "_rec", "red");
+    }
+
+	//Hidden layer 3/L (need dedicated computation because of the labels)
+	let z = matrix_multiply(r[2],a[2]);
+	z = arrAdd(z, b[3]);
+	let z2 = matrix_multiply(labelRec,labels);
+	z = arrAdd(z,z2);
+	q[3] = z.map(sigmoid);
+	a[3] = q[3].map(sample);
+	colorUnit(q[3],a[3],"h3_rec", "red");
+	//a[3].map(function(x,i){document.getElementById("h3_rec" + i).style.background = "#" + hexes2[x] + "0000";});
+
+}
+
+//Update generative weights
+function updategen() {
+
+	////Collect weight data
+	if (Report == 1) {
+		allData = "";
+				allData += "<br><br>START:<br>GEN MODEL: <br><br>";
+	}
+
+    for (var l = 0; l < dims.length; l++) {
+    	d_d[l] = arrAdd(a[l], scale(p[l],-1));
+    	d[l] = scale(arrAdd(d[l],scale(d_d[l], alpha)),(1-lambdaBase)); 
+    	if (l < dims.length-1) {	
+    		d_g[l] = outer(d_d[l],a[l+1]);
+    		g[l] = matrix_scale(matAdd(g[l],matrix_scale(d_g[l], alpha)),(1-lambdaBase));
+
+    	}
+    }
+    //labels
+    label_d_d = arrAdd(labels, scale(label_p,-1));
+    label_d = scale(arrAdd(label_d,scale(label_d_d, (alpha*4))),(1-lambdaBase));
+    d_gl = outer(label_d_d, a[3]);
+    labelGen = matrix_scale(matAdd(labelGen,matrix_scale(d_gl, alpha)),(1-lambdaBase));
+
+        //IGNORING reporting for now
+		//if (Report == 1) {
+		//	allData += "GEN BIASES: " + i + ": " + temp_d[i] + "<br>";
+		//}
+			//if (Report == 1) {
+			//	allData += "GEN H3>Labels: Unit" + i + "--> Unit" + j + ": " + (numWeights + (numH3 * numLabels) + (j-numUnits)) + ": " + temp_w[numWeights + (numH3 * numLabels) + (j-numUnits)] +"<br>";
+			//}
+
+}
+
+//Drive using gen weights
+function fantasy() {
+
+	//Hidden layer 3:  (*Bias | Carried over from previous forwardprop)
+	let L = dims.length-1
+	if (feedback == 0 && bmode == 1) {
+		p[L] = d[L].map(sigmoid);
+		a[L] = p[L].map(function(x) { return (Math.random() < x)/1.});
+	}
+		//Display
+    colorUnit(p[L],a[L],"h3_gen","blue");
+	//a[L].map(function(x,i){document.getElementById("h3_gen" + i).style.background = "#00" + hexes[x] + "" + hexes[x];});
+	
+	//Labels
+	let z = matrix_multiply(labelGen,a[L]);
+	z = arrAdd(z, label_d);
+
+	label_p = z.map(sigmoid);
+	labels = label_p.map(sample);
+	colorUnit(label_p, labels, "gen_label", "blue");
+	//labels.map(function(x,i){document.getElementById("gen_label" + i).style.background = "#00" + hexes[x] + "" + hexes[x];});
+
+    //Fancy colors (vectorized)
+    //let colorMe = label_p.map(function(x,i) {return Math.floor(x * labels[i] *255).toString();});
+    //let colHex = colorMe.map(function(x) {return baseConverter(x,10,16)});
+    //colHex.map(function(x,i){document.getElementById("gen_label" + i).style.background = "#00" + x + "" + x;});
+
+	//Hidden layers L-1 through 0(input)
+	for (var l = dims.length-2; l>=0; l--) {
+        let z = matrix_multiply(g[l],a[l+1]);
+        z = arrAdd(z, d[l]);
+        p[l] = z.map(sigmoid);
+	    a[l] = p[l].map(sample);
+	    colorUnit(p[l],a[l],"h" + l + "_gen", "blue");
+	    //a[l].map(function(x,i){document.getElementById("h" + l + "_gen" + i).style.background = "#00" + hexes[x] + "" + hexes[x];});
+	}
+
+	//let colorMu = p[0].map(function(x,i){return Math.floor(x * a[0][i] * 255).toString();});
+	//let colHux = colorMu.map(function(x) {return baseConverter(x,10,16)});
+	//colHux.map(function(x,i){document.getElementById("h0_gen" + i).style.background = "#00" + x + "" + x;});
+
+}
+
+//Update recog weights
+function updaterec() {
+
+    ///Collect weight data
+	if (Report == 1) {
+		allData += "<br><br>REC MODEL: <br><br>";
+	}
+
+    for (var l = 1; l < dims.length-1; l++) {
+    	d_b[l] = arrAdd(a[l], scale(q[l],-1));
+    	b[l] = scale(arrAdd(b[l],scale(d_b[l], alpha)),(1-lambdaBase)); 
+
+    	d_r[l-1] = outer(d_b[l],a[l-1]);
+    	r[l-1] = matrix_scale(matAdd(r[l-1],matrix_scale(d_r[l-1], alpha)),(1-lambdaBase));
+    }
+
+    //labels
+    label_d_b = arrAdd(labels, scale(label_q,-1));
+    label_b = scale(arrAdd(label_b,scale(label_d_b, alpha)),(1-lambdaBase));
+    d_rl = outer(a[3], label_d_b);
+    labelRec = matrix_scale(matAdd(labelRec,matrix_scale(d_rl, alpha)),(1-lambdaBase));
+
+		//if (Report == 1) {
+		//	allData += "REC BIASES: " + i + ": " + temp_b[i] + "<br>";
+		//}
+		//	if (Report == 1) {
+		//		allData += "REC I>H1: Unit" + j + "--> Unit" + i + ": " + (j+((i-numI)*numI)) + ": " + w[(j+((i-numI)*numI))] + "<br>";
+		//	}
+		//
+        //if (Report == 1) {
+		//		allData += "REC H1>H2: Unit" + j + "--> Unit" + i + ": " + ((j-numI)+((i-numH1)*numH1)) + ": " + w[((j-numI)+((i-numH1)*numH1))] + "<br>";
+		//	}
+		//	if (Report == 1) {
+		//		allData += "REC H2>H3: Unit" + j + "--> Unit" + i + ": " + (j+((i-numH2)*numH2)) + ": " + w[(j+((i-numH2)*numH2))] + "<br>";
+		//	}
+		//	if (Report == 1) {
+		//		allData += "REC Labels>H3: Unit" + j + "--> Unit" + i + ": " + (j-numUnits) + numWeights + ": " + w[(j-numUnits) + numWeights] + "<br>";
+		//	}
+	//if (Report == 1) {
+	//	var myWindow = window.open("", "", "width=800, height=600");
+	//	myWindow.document.write(allData);
+	//	Report = 0;
+	//}
+}
+
+//Update counter
+function updateC() {
+	cycles = cycles + 1;
+	document.getElementById("cycles").innerHTML = "Cycles: " + cycles;
+	//document.getElementById("weights").innerHTML = " ";
+//for (i=0;i < 10; i++) {
+//	document.getElementById("weights").innerHTML += "<div style='color: #FF0000'>w" + (i + 200) + ": " + w[200 + i]; + "/div"
+//	document.getElementById("weights").innerHTML += "<div style='color: #00FF00'>w" + (i + 700) + ": " + w[700 + i]; + "</div>";
+//}
+
+
+}
+
+//Loop command (last # sets delay)
+clearInterval (clockStart);
+clockStart = setInterval (main, interSpeed);
+
+</script>
+
+
+	<meta charset="utf-8" />
+	<title>CSS_NN_GFX</title>
+	<meta name="generator" content="BBEdit 10.5" />
+
+<style type = "text/css" media = "screen">
+
+/*	a {
+	height: 1px;
+	outline: none;
+	text-decoration: none; 
+	background: transparent; 
+	color: #D4DEB3; 
+	font-family: Arial, Helvetica, sans-serif;
+	} */
+
+	body {
+		background: #000000;
+		font-size: 16px;
+		color: #000000;
+		font-family: Arial;
+	}
+	
+	.wrapper {
+		width: 2000px;
+		height: 1200px;
+		margin-left: 64px;
+		margin-right: auto;
+		margin-bottom: 40px;
+		margin-top: 20px;
+		text-align: left; 
+	}
+
+	.header {
+		/*color: #00FFAA; */
+	}
+
+	.graph {
+		margin-top: 200px;
+		margin-left: 20px;
+		float:left;
+		height: 300px;
+		width: 420px;
+		background: #121212;
+		display: table-cell;
+	}
+	
+	.sixtyfour {
+		margin-top: 64px;
+		font-size: 64px;
+	}
+	
+	.thirtytwo {
+		font-size: 24px;
+	}
+	
+	.sixteen {
+		font-size: 12px;
+	}
+			
+	.container {
+		float: left;
+		background: #992222;
+		margin-left: 0px;
+		margin-top: 20px;
+		margin-right: 20px;
+		margin-bottom: 200px;
+		width: 650px;
+		height: 800px;
+		}
+
+	.containerL {
+		float: left;
+		background: #992222;
+		margin-left: 0px;
+		margin-top: 0px;
+		margin-right: 20px;
+		margin-bottom: 200px;
+		width: 400px;
+		height: 800px;
+		}
+	
+	.unit {
+		text-align: center;
+		margin-left: 2px;
+		margin-right: 2px;
+		float: left;
+		margin-top: 2px;
+		margin-bottom: 2px;
+		width: 10px;
+		height: 10px;
+		background: #3CAA48;
+		border: 2px solid #220022;
+		color: #000000;
+	}
+
+.iunit {
+		text-align: center;
+		margin-left: 1px;
+		margin-right: 0px;
+		float: left;
+		margin-top: 0px;
+		margin-bottom: 1px;
+		width: 15px;
+		height: 15px;
+		background: #3CAA48;
+		border: 0px solid #22AA22;
+		color: #000000;
+	}
+
+.sunit {
+		text-align: center;
+		margin-left: 0px;
+		margin-right: 0px;
+		float: left;
+		margin-top: 0px;
+		margin-bottom: 0px;
+		width: 10px;
+		height: 10px;
+		background: #3CAA48;
+		border: 0px solid #22AA22;
+		color: #000000;
+	}
+	.button {
+		text-align: center;
+		margin-left: 2px;
+		margin-right: 2px;
+		float: left;
+		margin-top: 2px;
+		margin-bottom: 2px;
+		width: 40px;
+		height: 40px;
+		background: #3CAA48;
+		border: 2px solid #22AA22;
+		color: #000000;
+	}
+	
+	.hiddenlayer {
+		margin-top: 20px;
+		float: left;
+		margin-left: 10px;
+		margin-right: 10px;
+	
+	}
+
+	.inputlayer {
+		margin-top: 20px;
+	}
+	
+	.list {
+		float: left;
+		background: #000000;
+		margin-top: 20px;
+		margin-right: 26px;
+		margin-bottom: 200px;
+		width: 400px;
+		height: 1000px;
+		font-size: 16px;
+		color: #22AA22;
+	}
+
+	.title {
+		padding-bottom:10px;
+		font-size:20px;
+		color: #FF2222;
+	}
+
+
+
+	.panel {
+		float: left;
+		margin-left: 0px;
+		margin-top: 20px;
+		margin-right: 0px;
+		margin-bottom: 20px;
+		width: 100px;
+		height: 640px;
+		color: #DD2222;
+		}
+
+	.bar {
+		border: 1px solid #220022;
+		background: #AA7820;
+		width: 8px;
+		display: inline-block;
+		vertical-align: bottom;
+	}
+	
+</style>
+
 </head>
 <body>
-    <div>
-    <p>Hi.</p>
-    </div>
+
+<div class="wrapper">
+
+<div class="header">
+	<div class="thirtytwo" style="color: #00FFCC;">Helmholtz Machine - GFX</div>
+	
+	<div class="sixteen"></div>
+	<div class="sixteen"></div>
+</div>
+
+
+<div class="containerL">
+	<div class="title" id="INPUT" style="background: #000000;">
+		INPUT
+	</div>
+	<div class="inputlayer" id="input" style="width:280px;">
+	</div>
+	<br><div class="hiddenlayer" id="H1" style="width:400px;">
+	</div></br>
+	<br><div class="hiddenlayer" id="H2">
+	</div></br>
+	<br><div class="hiddenlayer" id="H3">		
+	</div></br>
+	<div class="hiddenlayer" id="label" style="width:400px;">		
+	</div>
+</div>
+
+<div class="containerL">
+	<div class="title" id="OUTPUT" style="background: #000000;">
+		<div style='color: #00FFFF'>
+			OUTPUT
+		</div>
+	</div>
+	<div class="inputlayer" id="L1" style="margin-bottom:20px; width:280px;">
+	</div>
+	<div class="hiddenlayer" id="L2">
+	</div>
+	<div class="hiddenlayer" id="L3">
+	</div>
+	<div class="hiddenlayer" id="L4">
+	</div>
+	<div class="hiddenlayer" id="genLabel" style="width:400px;">
+	</div>
+</div>
+
+<div class="panel">
+	<div class="title" id="CONTROL" style="background: #000000;">
+		<div style='color: #000000'>
+			CONTROL
+		</div>
+	</div>
+	<div class="inputlayer" id="controls">
+		<!--<div class="button" id="n0" onclick= 'javascript:readfile("random", 0)'>Train on<br>all files</div>-->
+		<div class="button" id="n0" onclick= 'javascript:changeInput(0)'>Noise</div>
+		<div class="button" id="n7" onclick= 'javascript:changeInput(7)'>Random image</div>
+		<div class="button" id="n8" onclick= 'javascript:changeInput(8)'>MNIST</div>
+		<div class="button" id="n1" onclick= 'javascript:readFile("input1.html", 1)'>File1</div>
+		<div class="button" id="n2" onclick= 'javascript:readFile("input2.html", 2)'>File2</div>
+		<div class="button" id="n3" onclick= 'javascript:readFile("input3.html", 3)'>File3</div>
+		<div class="button" id="n4" onclick= 'javascript:readFile("input4.html", 4)'>File4</div>
+
+		<div class="button" id="n5" onclick= 'javascript:changeInput(5)'>Feed<br>back</br></div>
+		<div class = "button" id = "tb0" style= "background: #FF0000;" onclick='javascript:toggleLearning();'>
+			Learn
+		</div>		
+		<div class="cycles" id="speed"></div>
+		<div class="cycles" id="lambda"></div>
+		<div class="cycles" id="cycles"></div>
+		<div class="button" id="n6" onclick= 'javascript:resetWeights()'>Reset</div>
+		<div class="button" id="p" onclick= 'javascript:togglePause()'>Pause</div>
+		<div class="button" id="rep" onclick= 'javascript:tellMe()'>Report</div>
+		<div class = "button" id = "est" onclick= 'javascript:toggleEstMode()'>FE Est</div>
+
+        <div id="info"></div>
+		<div id="C0"></div>
+
+		<div class="cycles" id="message"></div>
+		<div class="cycles" id="energy" style="color: #22AACC; width:800px;"></div>
+
+	</div>
+</div>
+	    <div class="graph" id="FE_graph"></div>
+
+
+</div>
+
 </body>
 </html>
